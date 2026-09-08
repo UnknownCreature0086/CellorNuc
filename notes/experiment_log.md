@@ -381,3 +381,173 @@ overinterpreted.
   - `results/q1/q1b_neutral_droplets.csv.gz`
   - `results/q1/q1b_summary.json`
   - `figures/q1b_neutral_origins.png`
+
+## 2026-09-07 — Q2 single-modality sc dataset B (6k)
+
+### Submission-ready answer
+
+I ran a global `CellorNucEM` fit on dataset B's raw `counts` layer using all
+10 supplied sc-signature genes and all 10 supplied sn-signature genes. Because
+the file is known to contain an sc library but has no assay column, I added the
+constant metadata column `modality="sc"`. As specified in the source, this
+column is used only to name the final classes; it is not used to fit the
+mixture. I followed the supplied single-modality demo with `min_counts=10`,
+`gamma_lo=0.05`, `gamma_hi=0.95`, `max_p_nuc=0.2`, and `min_p_cell=0.8`.
+
+**Q2a.** CellorNucEM classified **180 of 6,000 droplets as `Nucleus-like Cell
+(SC)`**, a fraction of **0.0300, or 3.00%**.
+
+| CellorNucEM classification | Droplets | Fraction | Percent |
+|---|---:|---:|---:|
+| Typical Cell (SC) | 5,820 | 0.9700 | 97.00% |
+| Nucleus-like Cell (SC) | 180 | 0.0300 | 3.00% |
+
+**Q2b.** The `sc_frac` histogram is **bimodal**, but highly imbalanced. It has
+a dominant cell-like mode near 1 and a much smaller nucleus-like mode near 0,
+with a broad bridge of observations between them. In the 40-bin histogram,
+2,583 observations fall in `[0.975, 1.000]`, while 265 fall in `[0, 0.025)`.
+The edge spikes should not be read as perfectly measured latent fractions:
+exact ratios of 0 or 1 are especially common when only a modest number of
+signature counts were observed.
+
+![Q2 sc_frac histogram](../figures/q2_sc_frac_histogram.png)
+
+### What the numbers mean
+
+For each droplet, the implementation computes
+
+```text
+x = raw counts over the sc-enriched genes
+y = raw counts over the sn-enriched genes
+m = modality_counts = x + y
+sc_frac = x / m
+```
+
+Thus, `sc_frac` near 1 means that nearly all observed signature counts came
+from the sc-enriched genes; `sc_frac` near 0 means that nearly all came from
+the sn-enriched genes. It is a signature-composition statistic, not the
+fraction of the whole transcriptome that is cytoplasmic and not itself a
+posterior probability.
+
+Of the 6,000 droplets, 5,973 have defined `sc_frac`; the remaining 27 have
+`m=0`, so their ratio is undefined. The overall median defined value is
+0.9579. The 180 nucleus-like hard calls have median `sc_frac=0`, mean 0.0247,
+and range 0–0.125. By contrast, the droplets ultimately labeled typical have
+median 0.9625. The histogram therefore exposes a distinct low-fraction tail
+that a single summary such as the median would hide.
+
+The constrained beta-binomial mixture estimated component mean fractions of
+0.9091 for the cell-like component and 0.2000 for the nucleus-like component,
+giving a separation of 0.7091. The two-component BIC was lower than the
+one-component BIC by 662.51, which is strong statistical support for two
+distributional components in the informative observations. However, the
+nucleus mean equals its imposed upper bound of 0.2. It must therefore be read
+as a constrained anchor, not as a freely estimated biological constant.
+Neither the BIC nor the two-component fit proves that every low-mode droplet
+is a lysed cell; cell-type-specific signature behavior and technical effects
+remain alternatives.
+
+### Continuous score versus hard classification
+
+The source converts `(x,m)` into `p_cell`, the fitted posterior probability of
+membership in the high-`sc_frac` component. It then calls an sc droplet
+`Nucleus-like Cell (SC)` only when both conditions are true:
+
+```text
+modality_counts >= 10  AND  p_cell < 0.05
+```
+
+The decision accounting is:
+
+| Model/evidence state | Droplets | Percent of all droplets | Final sc-only label |
+|---|---:|---:|---|
+| Confident nucleus-like (`p_cell < 0.05`) | 180 | 3.00% | Nucleus-like Cell (SC) |
+| Intermediate posterior (`0.05 <= p_cell <= 0.95`) | 508 | 8.47% | Typical Cell (SC) |
+| Confident cell-like (`p_cell > 0.95`) | 4,600 | 76.67% | Typical Cell (SC) |
+| Below `min_counts` | 712 | 11.87% | Typical Cell (SC) |
+
+This table explains a subtle source-code behavior: single-modality data have
+no displayed Neutral class. All 1,220 droplets that would be undecided because
+of intermediate posterior or low evidence are folded back into their known
+assay's typical label. Consequently, `Typical Cell (SC)` does **not** mean
+that every one of its 5,820 members had `p_cell > 0.95`.
+
+The raw ratio and posterior are connected but not interchangeable. `p_cell`
+uses the fitted component shapes, their mixture weights, and the denominator
+`m`. Two droplets with the same `sc_frac` can have different posterior
+certainty when one has 10 signature counts and another has 1,000. The
+posterior thresholds then turn that continuous evidence into conservative
+hard labels, while `min_counts` prevents a sparse ratio from becoming a hard
+call. The second figure makes these layers visible.
+
+![Q2 score to classification](../figures/q2_score_to_classification.png)
+
+The fitted cell mixture weight was 0.93525, corresponding to a soft
+nucleus-component weight of 0.06475 among informative droplets. Summing each
+informative droplet's posterior nucleus probability gives 342.06 expected
+nucleus-component memberships, or 6.47% of the 5,288 informative droplets.
+This is deliberately larger than the 3.00% hard-call fraction: soft membership
+credits ambiguous droplets fractionally, whereas the hard rate counts only
+droplets past the stringent 0.05 cutoff and the count gate. For the quiz's
+literal Q2a wording, 3.00% is the answer; 6.47% is a useful model diagnostic,
+not a replacement for it.
+
+### Why the fraction matters, and its limitations
+
+The 3% fraction is an estimate of the library's confidently flagged
+nucleus-like burden. In a real sc project it can guide QC, flag libraries or
+cell populations for review, and quantify how much downstream expression,
+clustering, differential-expression, or abundance analysis might be affected
+by droplets with depleted cytoplasmic signal. A higher fraction would raise
+greater concern about preparation quality or contamination. The scientific
+cost of removing 3% may still be nontrivial if those droplets are concentrated
+in a rare cell type.
+
+They are not distributed uniformly across the supplied annotations. For
+example, 35/69 annotated `CCD-PC` droplets and 15/25 `CCD-PC|CNT doub`
+droplets were flagged, while many larger cell-type groups had much lower
+rates. These small-group percentages are imprecise, but the concentration is
+a warning against interpreting every flag as proven cytoplasmic lysis or
+blindly filtering all 180 droplets. It could reflect true cell-type-specific
+susceptibility, annotation/doublet effects, or lack of universality of the
+short signature. The saved cell-type and batch tables support that review;
+orthogonal QC evidence would be needed to establish mechanism.
+
+In general:
+
+- a clearly **unimodal high-`sc_frac`** distribution would suggest one largely
+  intact-cell population and little evidence for a distinct nuclear-like
+  subgroup;
+- a clearly **bimodal** distribution suggests two compositional regimes and
+  makes a cell-like/nucleus-like mixture interpretation plausible;
+- modes alone are not classifications. Their overlap, count depth, fitted
+  posterior, and thresholds determine which individual droplets receive hard
+  calls.
+
+### Reproducible run record
+
+- Script: `scripts/q2_single.py`
+- Command:
+
+  ```bash
+  MPLCONFIGDIR=/private/tmp/cellornuc-mpl \
+    XDG_CACHE_HOME=/private/tmp/cellornuc-cache \
+    .venv/bin/python scripts/q2_single.py
+  ```
+
+- Input: `data/single_KidneyRaji_sc_6k.h5ad` (`6,000 x 28,562`).
+- Method: global constrained `CellorNucEM` on `layer="counts"`; a constant
+  `modality="sc"` was added for post-fit class naming.
+- Signature overlap: 10/10 sc genes and 10/10 sn genes.
+- Outputs:
+  - `results/q2/summary.json`
+  - `results/q2/classification_counts.csv`
+  - `results/q2/decision_gate_counts.csv`
+  - `results/q2/sc_frac_histogram_bins.csv`
+  - `results/q2/sc_frac_summary.csv`
+  - `results/q2/nucleus_like_by_cell_type.csv`
+  - `results/q2/nucleus_like_by_batch.csv`
+  - `results/q2/droplet_classifications.csv.gz`
+  - `results/q2/single_6k_cellornucem.h5ad`
+  - `figures/q2_sc_frac_histogram.png`
+  - `figures/q2_score_to_classification.png`

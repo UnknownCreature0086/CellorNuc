@@ -3,8 +3,10 @@
 Reproducible analyses for the CellorNuc starter quiz. Q1a evaluates the
 CellorNucEM signature on an independent mixed cell/nucleus dataset; Q1b traces
 the resulting Neutral calls to the count and posterior gates in the supplied
-implementation. The datasets live in `data/`, and the professor-provided
-ScanpyPlus toolkit lives in `scanpyplus/`.
+implementation; Q2 applies the constrained classifier to an sc-only dataset
+and connects its bimodal raw score distribution to the hard calls. The
+datasets live in `data/`, and the professor-provided ScanpyPlus toolkit lives
+in `scanpyplus/`.
 
 ## Environment
 
@@ -67,7 +69,8 @@ CellorNuc/
 │   ├── inspect_data.py
 │   │   Scaffold for reusable AnnData schema and count-layer inspection.
 │   ├── q2_single.py
-│   │   Scaffold for the single-modality Q2 analysis.
+│   │   Q2: runs constrained CellorNucEM on sc-only dataset B, saves the
+│   │   sc_frac histogram, audits decision gates, and writes result tables.
 │   ├── q3_initialization.py
 │   │   Scaffold for the Q3 initialization analysis.
 │   └── bonus_celltypes.py
@@ -81,7 +84,7 @@ CellorNuc/
 │   ├── source_reading.md
 │   │   Detailed reading of CellorNucEM, its beta-binomial model, and API rules.
 │   └── experiment_log.md
-│       Submission-ready Q1a/Q1b answers, figure interpretations, parameters,
+│       Submission-ready Q1/Q2 answers, figure interpretations, parameters,
 │       caveats, commands, and recorded findings.
 │
 ├── figures/                                   # generated; Git-ignored
@@ -89,8 +92,12 @@ CellorNuc/
 │   │   Keeps the otherwise-empty output directory in Git.
 │   ├── q1_cellornucem_diagnostics.png
 │   │   Q1a: known source vs prediction UMAPs plus sc_frac/p_cell distributions.
-│   └── q1b_neutral_origins.png
+│   ├── q1b_neutral_origins.png
 │       Q1b: modality_counts histogram/ECDF, Neutral causes, and decision gates.
+│   ├── q2_sc_frac_histogram.png
+│   │   Q2: requested sc_frac histogram and fitted component means.
+│   └── q2_score_to_classification.png
+│       Q2: hard-class overlay and sc_frac-to-posterior decision relationship.
 │
 └── results/                                   # generated; Git-ignored
     ├── q1/
@@ -118,8 +125,9 @@ CellorNuc/
     │   │   Exact Neutral-cause counts and percentages by source.
     │   └── q1b_neutral_droplets.csv.gz
     │       Per-droplet records for all Neutral calls and their assigned cause.
-    ├── q2/.gitkeep
-    │   Placeholder for generated Q2 results.
+    ├── q2/
+    │   Q2 summaries, histogram bins, group audits, per-droplet calls, and the
+    │   annotated sc-only AnnData result (generated and Git-ignored).
     └── q3/.gitkeep
         Placeholder for generated Q3 results.
 ```
@@ -143,6 +151,19 @@ The current 6k run produced 4,783 correct calls among 4,849 confident calls
 (85.75%) had fewer than 10 signature counts and 164 had an intermediate
 posterior. See `notes/experiment_log.md` for the full interpretation and
 submission-ready text.
+
+## Run Q2
+
+```bash
+python scripts/q2_single.py
+```
+
+The current dataset-B run classified 180/6,000 droplets (3.00%) as
+`Nucleus-like Cell (SC)`. Its `sc_frac` distribution is bimodal, with a
+dominant near-one mode and a smaller near-zero mode. The script also records
+the low-count and intermediate-posterior droplets that the single-modality API
+folds into `Typical Cell (SC)`. See `notes/experiment_log.md` for the complete
+interpretation and caveats.
 
 Start with the 6k datasets for development; reserve the full datasets for the
 later confirmation phase.
