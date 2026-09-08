@@ -1335,3 +1335,376 @@ Cell 25 closes with a compact API checklist.
 - Saved notebook outputs contain no user-specific absolute path.
 - The notebook does not run the `init='split'` comparison, preserving that as a
   separate controlled experiment rather than mixing it into the basic API demo.
+
+## 15. Starter quiz 的完整证据链（对应 `CellorNuc_quiz_6k.ipynb`）
+
+这一节把前面的源码阅读重新压缩成一条可以用于答题和口头解释的主线：
+
+> `CellorNucEM` 不是根据全转录组直接判断一个 droplet 的物理结构；它先把
+> droplet 压缩为 sc/sn 两组 signature 的原始计数构成，再拟合两个
+> beta-binomial 成分，最后把高 `sc_frac` 成分解释为 cell-like、低
+> `sc_frac` 成分解释为 nucleus-like。
+
+因此，starter quiz 的三部分其实依次在问：
+
+1. **Q1：外部有效性。** 在同时含已知 cells 和 nuclei 的独立数据上，模型方向是否正确？
+2. **Q1b：不确定性的来源。** Neutral 是因为没有足够的 signature 计数，还是因为有计数但 posterior 仍不明确？
+3. **Q2：异常筛查。** 在名义上只有 cells 的数据里，是否存在一个低 `sc_frac`、高置信的少数群体？
+4. **Q3：可识别性。** 当数据只含一种主要 modality 时，少数/反向成分到底由数据决定，还是会被初始化方式明显影响？
+
+### 15.1 从输入到标签：代码逻辑图
+
+```mermaid
+flowchart TD
+    A[AnnData: droplets x genes] --> B[选择原始整数 count layer]
+    S[sc_genes / sn_genes] --> C[与 var_names 取交集]
+    B --> C
+    C --> X[x_i = sc-signature counts]
+    C --> Y[y_i = sn-signature counts]
+    X --> M[m_i = x_i + y_i]
+    Y --> M
+    M --> R[sc_frac_i = x_i / m_i]
+
+    M --> G{m_i >= min_counts?}
+    G -- yes: informative --> U[压缩为 unique x,m pairs + frequencies]
+    IA[init=anchored: 从低于 anchor_lo 和高于 anchor_hi 的 tails 起步] --> EM
+    IS[init=split: 在 aggregate signature fraction 两侧起步] --> EM
+    U --> EM[两成分 beta-binomial EM]
+    HC[max_p_nuc / min_p_cell: M-step 后投影 component means] --> EM
+    EM --> F[global fit: ab_cell, ab_nuc, lam_cell, loglik, BIC]
+
+    CT{提供 cell_type_col?} -->|yes| L[global warm start; 尝试各 cell type refit]
+    F --> CT
+    L -->|样本不足 / separation 太小 / fit 失败| FB[global_fallback]
+    L -->|通过检查| PF[per_cell_type fit]
+    CT -->|no| GF[global fit for every droplet]
+
+    F --> P[p_cell_i = P high-mean component given x_i,m_i]
+    FB --> P
+    PF --> P
+    GF --> P
+    X --> P
+    M --> P
+
+    P --> D{posterior + evidence gate}
+    G -- no: low evidence --> D
+    D -->|m >= threshold and p_cell > gamma_hi| CH[cell-like direction]
+    D -->|m >= threshold and p_cell < gamma_lo| NH[nucleus-like direction]
+    D -->|otherwise| UN[undecided]
+
+    META[optional assay_col; only names classes post hoc] --> NAME[metadata-aware naming]
+    CH --> NAME
+    NH --> NAME
+    UN --> MIX{recognized assay contains one or two modalities?}
+    MIX -->|mixed / no assay metadata| NEU[Neutral]
+    MIX -->|sc-only or sn-only| TYP[fold undecided into own Typical label]
+    NAME --> OUT[modality_classification]
+    NEU --> OUT
+    TYP --> OUT
+
+    F --> DIAG[component means, concentration, separation, lam_cell, BIC]
+    R --> RAW[raw-composition figures]
+    P --> POST[posterior and gate summaries]
+    OUT --> TAB[classification tables and UMAP overlays]
+```
+
+读图时要抓住四条支路：
+
+- `sc_frac` 是直接从 count 得到的**原始构成比例**；
+- component mean 是一个 fitted component 的**群体中心**；
+- `p_cell` 是每个 droplet 属于高均值成分的**后验概率**；
+- `modality_classification` 是 posterior、`min_counts` 和可选 assay metadata
+  共同产生的**离散标签**。
+
+这四个量不能互换。尤其是两个 droplet 即使 `sc_frac` 相同，只要
+`modality_counts` 不同，它们的 `p_cell` 就可能不同；一个 component mean
+也不是任何单个 droplet 的 posterior。
+
+### 15.2 生物学背景：模型真正捕捉的信号
+
+完整细胞通常保留更多胞质成熟 mRNA；单核转录组则更富集未剪接转录本、
+内含子 reads 和核内保留 RNA。`hcka_v1` signature 用十个 sc-enriched 和
+十个 sn-enriched genes 把这一差异投影到一个很低维的轴上。
+
+对 droplet `i`：
+
+```text
+x_i = sum counts across available sc genes
+y_i = sum counts across available sn genes
+m_i = x_i + y_i
+sc_frac_i = x_i / m_i
+```
+
+这里的生物学判断是“signature composition 更像 cell 还是 nucleus”，而不是
+直接观察细胞膜、胞质是否完整。因此：
+
+- `Nucleus-like Cell (SC)` 是“来源 metadata 说它来自 sc library，但
+  signature composition 更像 fitted low component”；
+- 它可以由真实游离细胞核/胞质裂解造成，也可以由 cell type、RNA depth、
+  dropout、ambient RNA、doublet、signature transfer failure 等造成；
+- 单凭 classifier 不能在这些机制之间做因果区分。
+
+### 15.3 数学主线：为什么用 beta-binomial mixture
+
+对 component `k`，代码等价于：
+
+```text
+q_i | Z_i=k       ~ Beta(a_k, b_k)
+x_i | q_i,m_i,Z_i ~ Binomial(m_i, q_i)
+
+therefore
+x_i | m_i,Z_i     ~ BetaBinomial(m_i, a_k, b_k)
+```
+
+Binomial 假设同一成分内所有 droplets 有完全相同的成功率；Beta 层允许
+不同 droplets 的潜在 sc fraction 有额外异质性。这正是 beta-binomial 相对
+普通 binomial 的价值。
+
+每个成分最值得报告的不是孤立的 `a,b`，而是：
+
+```text
+component mean:          p_k = a_k / (a_k + b_k)
+component concentration: k_k = a_k + b_k
+```
+
+`p_k` 给出成分中心；concentration 越大，成分越集中。两成分 mixture 再增加
+`lam_cell = P(Z=cell-like)`。EM 的 E-step 更新 soft membership，M-step 更新
+`lam_cell` 和两组 `a,b`。
+
+droplet posterior 可写成：
+
+```text
+logit(p_cell_i)
+  = logit(lam_cell)
+  + log[BB(x_i | m_i, ab_cell) / BB(x_i | m_i, ab_nuc)]
+```
+
+所以 `p_cell` 同时包含 component prevalence、两个 component 的位置与
+离散程度、以及该 droplet 的 `x,m`；它绝不只是 `sc_frac` 的改名。
+
+### 15.4 为什么 notebook 选择这些 table
+
+| Notebook table/output | 为什么要 report | 它直接支撑什么结论 | 它不能单独证明什么 |
+|---|---|---|---|
+| Input manifest（文件名、大小、SHA-256） | 固定分析对象，排除“同名文件但内容不同” | 数值可复现、6k 与 full run 不会混淆 | 不支撑任何生物学结论 |
+| Dataset shape/layers/embeddings | 确认 observation、gene 数量，存在 raw-count layer 和 UMAP | 输入满足代码路径需要 | 有 UMAP 不代表分类正确 |
+| Signature overlap（supplied/found/missing） | `_set_counts_EM` 允许部分 overlap，缺 gene 会改变 `x/y/m` | A 实际用 10 个 sc、9 个 sn genes；B 用 10/10 | overlap 完整不等于 signature 可迁移 |
+| Q1 known modality counts | 明确 ground-truth metadata 和分母各为 3,000 | 后续 cell/nucleus rate 可比较 | metadata 可能仍含 preparation/annotation error |
+| Q1 classification count crosstab | 同时看到典型、discordant、Neutral 的绝对量 | 59 cells 走 nucleus-like 方向；7 nuclei 走 cell-like 方向 | 不能忽略 Neutral 后直接声称总体 98.64% accuracy |
+| Q1 within-modality percentages | 消除两组样本量影响并显示 coverage 不对称 | cells Neutral 6.87%，nuclei Neutral 31.50% | 不能说明差异由哪种机制造成 |
+| Q1 global fit summary | 报告 mixture 本身是否分开，而不只看 hard labels | component means 0.961/0.113，separation 0.848；code-defined delta BIC 1419 favors two components | BIC 不证明两个成分就是两个真实生物学实体 |
+| Q1 Neutral-source crosstab | 按代码 gate 对 Neutral 做穷尽分解 | 987 low-count + 164 intermediate-posterior = 1,151，说明主要是 evidence gate | 不能由“low count”进一步确定湿实验原因 |
+| Q1 `modality_counts.describe()` by source | 定量展示 evidence depth 的整体差异与尾部 | nuclei mean 50.3、median 24；cells mean 203.0、median 124 | mean 差异不自动等于每个 nucleus 都低于每个 cell |
+| Q2 class count + percent | 回答 quiz 明确要求的异常比例 | 180/6,000 = 3.00% `Nucleus-like Cell (SC)` | 其余 97% 不全是 posterior-confident cells |
+| Q2 undecided-before-fallback count | 审计 single-modality 的特殊改名规则 | 1,220 个 low-evidence/intermediate cases 被折回 Typical；Typical 不是 confidence 的同义词 | 不表示这 1,220 个 droplets 生物学上一定是完整 cells |
+| Q2 `sc_frac.describe()` | 给 histogram 的位置、spread、极端值和 missingness 一个数字摘要 | median 0.958；5th percentile 0.077；27 个 `m=0` 的 ratio 未定义 | quantiles 本身不能决定 mode 数量 |
+| Q2 constrained fit summary | 确认官方 sc-only 假设被落实并记录拟合结果 | low component 被 `max_p_nuc=0.2` 压在 0.2；high mean 0.909 | 这个 low component 的存在部分依赖外加约束，不能当成纯数据发现 |
+| Q3 fit table（case × init） | 保留每个 setting 的两个 component means、weight、separation 和 BIC | 看出哪一个 component 稳定、哪一个漂移 | 只看一行无法判断 initialization sensitivity |
+| Q3 absolute-difference table | 把“看起来不同”变成 0-1 scale 上可比较的 effect | B sc-only 的 minority mean 差 0.237；A-cell 差 0.184；A-nucleus 的 opposite mean 差 0.193 | 没有通用阈值把多少定义为“large”；需结合量纲和语境 |
+| Q3 `bic2_split_minus_anchored` | 比较两个局部解的 objective 是否有明显优劣 | B 只差约 0.49，说明几乎等价的拟合质量可对应很不同 minority mean | 极小 BIC 差不能选出“生物学正确”的 decomposition |
+
+表的组合方式也很重要：**count 给分子，percentage 给分母语境，fit diagnostics
+解释模型，gate audit 解释标签如何产生。** 只报其中一类会留下明显缺口。
+
+### 15.5 为什么 report 这些 headline numbers
+
+#### Q1：把 performance 和 abstention 分开
+
+```text
+confident droplets = 6000 - 1151 Neutral = 4849
+confident concordant = 2735 Typical Cell + 2048 Typical Nucleus = 4783
+confident discordant = 59 + 7 = 66
+
+concordance among confident = 4783 / 4849 = 98.64%
+overall coverage            = 4849 / 6000 = 80.82%
+overall discordant rate     = 66 / 6000   = 1.10%
+```
+
+98.64% 必须和 80.82% 一起报。前者回答“模型敢判时通常对不对”，后者回答
+“它愿意对多少 droplets 作出明确判断”。如果只报 98.64%，会掩盖 nuclei 中
+31.5% 的 Neutral；如果只报 overall discordance 1.10%，也会把大量 abstention
+当成正确结果。
+
+题目原文问 cell 是否被叫作 `Typical Nucleus (SN)`、nucleus 是否被叫作
+`Typical Cell (SC)`。在传入正确 `assay_col` 后，这两个 exact label 在代码上
+不会跨 source 出现，因为名字已经把 source metadata 编进去了。真正对应的
+error-direction 是：
+
+```text
+known cell    + low p_cell  -> Nucleus-like Cell (SC): 59
+known nucleus + high p_cell -> Cell-like Nucleus (SN): 7
+```
+
+这是解释 API 命名规则所必需的，不是在回避题目。
+
+component separation 0.848 和 delta BIC 1419 提供与 crosstab 不同的证据：
+前者说明两 fitted centers 在 signature fraction 轴上相距很远；后者说明即使
+对多三个参数惩罚后，二成分模型仍比单成分模型更符合这些 informative
+droplets。它们让“signature transfer well”不只是由 hard threshold 后的
+accuracy 得出。但它们仍需和 held-out source labels 的 concordance、coverage
+一起解释。
+
+#### Q1b：Neutral 的分子必须精确加回总数
+
+```text
+low signature evidence: 114 cells + 873 nuclei = 987
+intermediate posterior:   92 cells +  72 nuclei = 164
+total Neutral:                                  1151
+low-evidence share: 987 / 1151 = 85.75%
+```
+
+这是一个代码定义的、互斥且穷尽的 decomposition。因此可以强结论地说：
+“绝大多数 Neutral 直接来自 `m<10` gate。”但从这里到“为什么 `m<10`”属于
+机制推测；核 RNA 较少、signature 很短、dropout、某 sn gene 缺失、cell-type
+差异都合理，却不能由这张表单独区分。
+
+#### Q2：3% 是保守异常 call，不是第二成分 prevalence 的同义词
+
+```text
+Nucleus-like Cell (SC) = 180 / 6000 = 3.00%
+Typical Cell (SC)      = 5820 / 6000 = 97.00%
+undecided before single-sc fallback = 1220
+posterior-confident cell-like = 6000 - 180 - 1220 = 4600
+```
+
+所以 3% 的 operational definition 是：
+
+```text
+m >= 10 AND p_cell < 0.05 AND known assay == sc
+```
+
+它不是“EM low component 的全部质量”，也不是所有低 `sc_frac` droplets，
+更不是已经通过独立实验确认的裸核比例。相反，5820 个 Typical labels 包含
+4600 个 confident cell-like calls 和 1220 个 fallback cases。
+
+#### Q3：稳定的是 observed majority，漂移的是弱识别 component
+
+| Case | 稳定 component | 稳定 mean difference | 漂移 component | 漂移 mean difference |
+|---|---|---:|---|---:|
+| B sc-only | high/cell-like | 0.0019 | low/nominal nucleus-like | 0.2373 |
+| A cells only | high/cell-like | 0.0012 | low/nominal nucleus-like | 0.1840 |
+| A nuclei only | low/nucleus-like | 0.0110 | high/nominal cell-like | 0.1929 |
+
+三次实验构成一个对称的 control：只要删掉一种已知 modality，与剩余主群体
+匹配的 component 就稳定，而代表“缺失/稀少另一类”的 component 对
+initialization 敏感。这个重复模式比 dataset B 单独一次差异更有说服力。
+
+同时要纠正 quiz 标题中的术语混用：
+
+- `anchor_lo/anchor_hi` 只选择 EM **起点**；
+- `max_p_nuc/min_p_cell` 才是每次 M-step 后执行的 component-mean **硬边界**；
+- Q3 只改 `init` 并保持 hard constraints 为 `None`，所以它检验的是
+  initialization sensitivity，而不是约束强度。
+
+### 15.6 为什么画这些 figure，以及怎样读
+
+#### Q1 figure 1：`modality_counts` density + Neutral cause bars
+
+左图把 `log10(modality_counts + 1)` 按 known source 叠加，虚线对应
+`min_counts=10`。使用 log 轴是因为 counts 右偏且跨度很大；使用各组独立
+density (`common_norm=False`) 是为了比较 distribution shape，而不是让 3,000
+vs 3,000 的组大小决定曲线高度。
+
+读法：nucleus distribution 整体左移，而且大量面积落在阈值左边；这为
+“nuclei Neutral 多是 evidence depth 不足”提供直观解释。右侧 stacked bars
+再把 Neutral 精确分成 low-count 和 intermediate-posterior，使视觉印象与代码
+decomposition 对上。
+
+这两幅 panel 形成“分布原因 + exact count”配对。左图不能告诉你一个 bar
+里有多少 droplets；右图不能展示 counts 离阈值多远，所以两者互补。
+
+#### Q1 figure 2：classification UMAP
+
+UMAP 回答的是“discordant/Neutral calls 是否在表达空间中形成特定 cluster、
+boundary 或广泛散布”。如果异常集中于某一 cluster，应该进一步检查 cell
+type、batch 或 QC；如果跨 cluster 分散，则更像全局 signature/evidence 问题。
+
+但 UMAP **不是** `CellorNucEM` 的输入，也不是 accuracy 图。邻近关系来自
+预先计算的全转录组 embedding，受 cell type、batch 和 preprocessing 影响。
+它适合生成 follow-up hypothesis，不适合单独证明 cell/nucleus biology。
+
+#### Q2 figure：`sc_frac` histogram + classification UMAP
+
+左图直接回答 Q2b。主峰在 0.95-1.00，另有一个小而不对称的 near-zero
+富集和中间 bridge，因此最准确的措辞是“strongly imbalanced practical
+bimodality”，而不是暗示两个对称、大小相近的峰。
+
+颜色叠加把 180 个 strict anomalous calls 放回 raw score distribution，说明
+hard calls 主要来自低端；但分类由完整 posterior 和 `m>=10` 决定，所以不能
+从一个固定 `sc_frac` x-coordinate 推断标签。`m=0` 的 27 个 droplets 因
+`sc_frac=NaN` 不出现在 histogram 中，也必须在文字中交代。
+
+右图显示 180 个异常是否局限在少数 expression neighborhoods。这对后续
+cell-type/batch 检查有用，但仍不是物理核结构的验证。
+
+#### Q3 figure：同一 raw distribution 上叠加两种 initialization 的 component means
+
+灰色 histogram 在每个 case 内只画一次，因为改变 `init` 不会改变输入
+`sc_frac` distribution。红/蓝区分 high/low components，实线/虚线区分
+anchored/split。
+
+正确读法不是比较柱高，而是比较同色实线与虚线之间的水平距离：
+
+- B sc-only 和 A cells-only 的红线重合、蓝线分开；
+- A nuclei-only 的蓝线重合、红线分开。
+
+这把“majority component stable, absent/minority component unstable”直接画了
+出来。表中的 BIC 再补充说明这些不同的 component means 对应几乎相同的
+objective value；仅凭 histogram 不能看出这一点。
+
+#### Bonus figures 为什么放在核心题之后
+
+Bonus 的 identity-specific rate/score plots 回答的是“哪些 biological groups
+驱动低 score 或 Neutral”，属于机制 follow-up，不是 Q1-Q3 的必要证据。
+
+- rate + Wilson interval 同时报 point estimate 和小样本不确定性；
+- median + IQR 比 mean 更抗 skew 和极端 posterior；
+- 在 dataset A 内按 known source 分层，避免 cell-vs-nucleus 主效应吞掉
+  cell-type association；
+- UMAP cluster purity 只作 annotation sanity check，不被误写成 biological
+  accuracy。
+
+因此这些图适合提出“cell type、doublet、fragility、depth 或 batch”假设，
+但不把 association 写成因果结论。
+
+### 15.7 一段可以直接用于 starter quiz 的总解释
+
+在独立 mixed 6k 数据上，`CellorNucEM` 的两个 fitted signature-composition
+成分中心为约 0.961 和 0.113，且 code-defined BIC 强烈偏好二成分模型。
+在 4,849 个 non-Neutral droplets 中，4,783 个与已知 modality 方向一致，
+confident concordance 为 98.64%；但总体 coverage 只有 80.82%，主要因为
+nuclei 的 signature evidence 较低。1,151 个 Neutral 中有 987 个（85.75%）
+直接未通过 `modality_counts>=10`，其余 164 个有足够 counts 但 posterior 位于
+中间区间。
+
+在 nominal sc-only dataset B 上，官方 constrained setting 把 180/6,000
+（3.00%）droplets 标为 `Nucleus-like Cell (SC)`。`sc_frac` 呈一个接近 1 的
+dominant mode，加一个小的 near-zero enrichment；这提示少数 low-signature-
+fraction profiles，但 label 仍依赖 count depth 和 fitted posterior。另有 1,220
+个 undecided/low-evidence droplets 被 single-modality fallback 归入 Typical，
+所以 Typical 不等于全部高置信。
+
+最后，anchored 与 split initialization 在三组 one-modality experiments 中都
+给出同一模式：匹配 observed majority 的 component mean 几乎不变，代表缺失
+或稀少 opposite modality 的 mean 可移动约 0.18-0.24，而两条路径的 BIC2
+几乎相同。这说明单一 modality 下的 minority component 弱可识别，初始化能
+改变 mixture 对同一 distribution 的拆分方式；anchors 提供起点，不能创造
+数据里本来不存在的第二种 biology。
+
+### 15.8 最后检查：结论强度不要超过证据
+
+可以较强地说：
+
+- mixed data 中，signature 在有足够证据的 droplets 上方向一致性很高；
+- 大多数 Neutral 是 `min_counts` gate 的直接结果；
+- sc-only data 存在少量 high-confidence low-component calls；
+- one-modality minority-component parameters 对 initialization 敏感。
+
+应当保留限定地说：
+
+- 3% calls 是“nucleus-like signature profiles”，不是已经确认的裸核率；
+- 二成分 BIC 优势不是两个真实生物实体的证明；
+- UMAP 聚集不是因果机制；
+- cell-type、lysis、ambient RNA、doublets、depth 和 missing signature gene
+  都是 plausible explanations，仍需要独立 marker、batch/donor replication、
+  imaging 或实验 fractionation 才能区分。
