@@ -4,9 +4,11 @@ Reproducible analyses for the CellorNuc starter quiz. Q1a evaluates the
 CellorNucEM signature on an independent mixed cell/nucleus dataset; Q1b traces
 the resulting Neutral calls to the count and posterior gates in the supplied
 implementation; Q2 applies the constrained classifier to an sc-only dataset
-and connects its bimodal raw score distribution to the hard calls. The
-datasets live in `data/`, and the professor-provided ScanpyPlus toolkit lives
-in `scanpyplus/`.
+and connects its bimodal raw score distribution to the hard calls; Q3 measures
+the sensitivity of single-modality fits to anchored versus split EM
+initialization on dataset B and on cell-only/nucleus-only subsets of dataset A.
+The datasets live in `data/`, and the professor-provided ScanpyPlus toolkit
+lives in `scanpyplus/`.
 
 ## Environment
 
@@ -72,7 +74,11 @@ CellorNuc/
 │   │   Q2: runs constrained CellorNucEM on sc-only dataset B, saves the
 │   │   sc_frac histogram, audits decision gates, and writes result tables.
 │   ├── q3_initialization.py
-│   │   Scaffold for the Q3 initialization analysis.
+│   │   Q3: changes only anchored versus split initialization and saves seed,
+│   │   fitted-parameter, posterior, and hard-label comparisons.
+│   ├── q3b_dataset_a_subsets.py
+│   │   Q3b: repeats the comparison on dataset A cells and nuclei separately,
+│   │   adds a balanced-A control, and compares the cell-only result with B.
 │   └── bonus_celltypes.py
 │       Scaffold for the optional cell-type-stratified analysis.
 │
@@ -84,7 +90,7 @@ CellorNuc/
 │   ├── source_reading.md
 │   │   Detailed reading of CellorNucEM, its beta-binomial model, and API rules.
 │   └── experiment_log.md
-│       Submission-ready Q1/Q2 answers, figure interpretations, parameters,
+│       Submission-ready Q1–Q3 answers, figure interpretations, parameters,
 │       caveats, commands, and recorded findings.
 │
 ├── figures/                                   # generated; Git-ignored
@@ -93,11 +99,17 @@ CellorNuc/
 │   ├── q1_cellornucem_diagnostics.png
 │   │   Q1a: known source vs prediction UMAPs plus sc_frac/p_cell distributions.
 │   ├── q1b_neutral_origins.png
-│       Q1b: modality_counts histogram/ECDF, Neutral causes, and decision gates.
+│   │   Q1b: modality_counts histogram/ECDF, Neutral causes, and decision gates.
 │   ├── q2_sc_frac_histogram.png
 │   │   Q2: requested sc_frac histogram and fitted component means.
-│   └── q2_score_to_classification.png
-│       Q2: hard-class overlay and sc_frac-to-posterior decision relationship.
+│   ├── q2_score_to_classification.png
+│   │   Q2: hard-class overlay and sc_frac-to-posterior decision relationship.
+│   ├── q3_initialization_comparison.png
+│   │   Q3 development-run fit, posterior, and classification diagnostics.
+│   ├── q3_full_initialization_comparison.png
+│   │   Q3 confirmation on the full 119,727-droplet dataset B.
+│   └── q3b_dataset_a_single_modality.png
+│       Q3b cell-only and nucleus-only dataset A diagnostics.
 │
 └── results/                                   # generated; Git-ignored
     ├── q1/
@@ -128,8 +140,13 @@ CellorNuc/
     ├── q2/
     │   Q2 summaries, histogram bins, group audits, per-droplet calls, and the
     │   annotated sc-only AnnData result (generated and Git-ignored).
-    └── q3/.gitkeep
-        Placeholder for generated Q3 results.
+    ├── q3/
+    │   Q3 seed and component tables, posterior and classification comparisons,
+    │   per-droplet values, and JSON summary for the 6k development run.
+    ├── q3_full/
+    │   The same Q3 outputs for the full-dataset confirmation run.
+    └── q3b/
+        Q3b subset, cross-dataset, convergence, and per-droplet comparisons.
 ```
 
 ## Run Q1
@@ -164,6 +181,45 @@ dominant near-one mode and a smaller near-zero mode. The script also records
 the low-count and intermediate-posterior droplets that the single-modality API
 folds into `Typical Cell (SC)`. See `notes/experiment_log.md` for the complete
 interpretation and caveats.
+
+## Run Q3
+
+Run the reproducible 6k development comparison:
+
+```bash
+python scripts/q3_initialization.py
+```
+
+Confirm it on the full dataset B without overwriting the development outputs:
+
+```bash
+python scripts/q3_initialization.py \
+  --input data/single_KidneyRaji_sc_full.h5ad \
+  --results-dir results/q3_full \
+  --figure figures/q3_full_initialization_comparison.png \
+  --convergence-audit-iterations 500
+```
+
+The full run found stable cell-component means (0.9208 anchored versus 0.9240
+split) but initialization-sensitive low-component means (0.3889 versus
+0.6408) under the requested 100-iteration defaults. The optional longer audit
+shows that the two paths eventually approach nearly the same solution. See
+`notes/experiment_log.md` for the mathematical explanation, large-difference
+criterion, convergence diagnosis, and figure interpretation.
+
+## Run Q3b
+
+```bash
+python scripts/q3b_dataset_a_subsets.py \
+  --convergence-audit-iterations 2000
+```
+
+On dataset A, the cell-only dominant component was stable while the nominal
+nucleus component changed by 0.1840; the nucleus-only dominant component was
+stable while the nominal cell component changed by 0.1929. By contrast, the
+original balanced dataset A produced essentially identical component means
+under both initializations. This isolates the sensitivity to the
+single-modality setting.
 
 Start with the 6k datasets for development; reserve the full datasets for the
 later confirmation phase.

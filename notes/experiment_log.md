@@ -551,3 +551,364 @@ In general:
   - `results/q2/single_6k_cellornucem.h5ad`
   - `figures/q2_sc_frac_histogram.png`
   - `figures/q2_score_to_classification.png`
+
+## 2026-09-07 — Q3 anchored versus split initialization on dataset B
+
+### Submission-ready answer
+
+I fit the same global two-component beta-binomial mixture twice on dataset B's
+raw `counts` layer. The model arguments were left at their API defaults
+(`min_counts=10`, `gamma_lo=0.1`, `gamma_hi=0.9`, no component-mean
+constraints); only `init="anchored"` versus `init="split"` changed. The table
+below reports the full 119,727-droplet dataset B result; 105,436 droplets met
+the signature-count threshold and entered the fit.
+
+| Fitted component | `p`, anchored | `p`, split | Absolute difference | Judgment |
+|---|---:|---:|---:|---|
+| High-mean/cell component | 0.9208 | 0.9240 | 0.0032 (0.32 percentage points) | Small/stable |
+| Low-mean/nominal nucleus component | 0.3889 | 0.6408 | 0.2519 (25.19 percentage points) | Large/unstable |
+
+Thus, the answer is asymmetric: **the fitted cell-component mean is essentially
+unchanged, but the low-component mean changes substantially**. Calling the
+second component “nucleus” follows the source variable name `ab_nuc`; in this
+known sc-only dataset, a fitted low component is not automatically proof of a
+separate biological nucleus population.
+
+There is no universal hypothesis test defining a “large” difference between
+two local solutions fitted to exactly the same observations. I therefore used
+a transparent practical rule before summarizing the result: flag a shift if it
+is both at least 0.05 on the 0–1 fraction scale and at least 10% of the anchored
+fit's component separation. The cell shift is only 0.0032 and 0.6% of that
+separation, so it is small. The low-component shift is 0.2519 and 47.4% of the
+anchored separation, exceeding both cutoffs by a wide margin. Its downstream
+impact also confirms that this is consequential rather than a rounding issue:
+88,100/119,727 hard labels (73.58%) differed under the default 0.1/0.9
+posterior rules, and the mean absolute posterior change among informative
+droplets was 0.1016.
+
+The hard-label percentage needs one important qualification. Under the split
+fit, the largest `p_cell` was 0.89997, just below the source's strict
+`p_cell > 0.9` rule. Consequently, the split run made zero `Cell-like` hard
+calls and left 114,795 droplets Neutral. This threshold cliff magnifies a
+smooth posterior shift; it should not be interpreted as evidence that 73.58%
+of the droplets changed biological identity.
+
+The result reproduced on the 6,000-droplet development sample. Its fitted
+means were 0.9133 versus 0.9151 for the high component and 0.3347 versus 0.5720
+for the low component. The low-component difference was again large (0.2373),
+while the cell-component difference was negligible (0.0019). In that sample,
+737/6,000 hard labels (12.28%) differed.
+
+A supplemental convergence audit explains much of this sensitivity. The
+public fit fixes the private EM helper at at most 100 iterations. When allowed
+up to 500 iterations on the full data, anchored stopped by the tolerance rule
+after 446 evaluated iterations and split after 298. Their high-component means
+then became 0.92347 and 0.92359, their low-component means became 0.56500 and
+0.58274, and their log likelihoods differed by only 0.0044. The remaining
+low-mean gap was 0.0177, below the practical large-difference cutoff. The same
+pattern held in the 6k sample (long-run low means 0.48305 and 0.50205).
+Therefore the large difference in the requested default runs is real, but it
+is mainly **initialization-dependent progress at the 100-iteration cap**, not
+evidence that the two initializations inevitably converge to incompatible
+final optima.
+
+### What “anchored” and “split” mean mathematically
+
+For droplet `i`, CellorNucEM first constructs
+
+```text
+x_i = raw counts over sc-enriched signature genes
+y_i = raw counts over sn-enriched signature genes
+m_i = x_i + y_i
+r_i = x_i / m_i = observed sc_frac
+```
+
+Only observations with `m_i >= 10` fit the default model. Conditional on a
+latent component `Z_i`, the model is
+
+```text
+q_i | Z_i=k ~ Beta(a_k, b_k)
+x_i | q_i, m_i, Z_i=k ~ Binomial(m_i, q_i)
+
+therefore
+
+x_i | m_i, Z_i=k ~ BetaBinomial(m_i, a_k, b_k),
+p_k = E(q_i | Z_i=k) = a_k / (a_k + b_k).
+```
+
+With mixture prevalence `lambda = P(Z_i=cell)`, the marginal likelihood for an
+observation is
+
+```text
+lambda * BB(x_i | m_i, a_cell, b_cell)
+  + (1-lambda) * BB(x_i | m_i, a_nuc, b_nuc).
+```
+
+EM alternates between an E-step, which calculates each observation's soft
+component membership, and an M-step, which refits the two weighted
+beta-binomial shapes and `lambda`. The final `p_cell` column is the posterior
+membership probability under the fitted parameters, not the raw `sc_frac` and
+not either component mean `p_k`.
+
+The two initialization modes select the first parameter values differently:
+
+- **Anchored:** seed the nominal cell component using unique `(x,m)` patterns
+  with `r_i > 0.7`, and seed the nominal nucleus component from patterns with
+  `r_i < 0.3`. These fixed tail regions are the “anchors.” On the full dataset,
+  their initial means were 0.9464 and 0.0949.
+- **Split:** calculate the evidence-weighted mean
+  `sum(x_i)/sum(m_i)`, then seed the two components on opposite sides of that
+  value. On this sc-dominated dataset the cutoff was 0.92991—inside the large
+  high-`sc_frac` population—so the starting means were 0.9840 and 0.6500.
+
+This explains the sensitivity. The split initialization assigns a large part
+of the broad cell-like peak to its initial “low” component (41,520 informative
+droplets below the split versus only 5,220 in the anchored `<0.3` tail). EM
+mixture likelihoods are non-convex and can also converge slowly along flat
+directions, so the two starts follow different parameter paths through the
+same skewed, highly imbalanced data. At the source's 100-iteration cap, the
+split path still had a broad, relatively high low component (`p=0.6408`, weight
+0.2044), whereas the anchored path had a lower and smaller component
+(`p=0.3889`, weight 0.1020). The extended audit shows that these paths continue
+moving toward nearly the same solution rather than remaining in those two
+default-fit states.
+
+This is especially likely in the single-modality case: fitting two flexible
+components to one dominant modality does not guarantee two biologically
+identifiable populations. A mixture can divide a broad or skewed distribution
+in several statistically plausible ways. At 100 iterations, split had the
+higher log likelihood (-304608.48 versus -304626.36), but neither run had yet
+reached the tolerance-based stopping point, so that comparison does not
+establish a different maximum-likelihood optimum. Both default fits strongly
+improved the implementation's two-component BIC over one component, but that
+supports distributional heterogeneity, not the claim that the low component
+consists of true nuclei.
+
+### Anchors are initialization, not constraints
+
+The source comments use “anchor” informally, but `anchor_lo` and `anchor_hi`
+only choose the data subsets used to initialize `(a,b)`. Once EM begins, those
+means are free to move. The full anchored low-component mean demonstrates this:
+it started at 0.0949 and finished at 0.3889.
+
+The actual persistent mean controls are separate arguments:
+
+```text
+max_p_nuc   # project the low-component mean down to this upper bound
+min_p_cell  # project the high-component mean up to this lower bound
+```
+
+They are `None` by default and were deliberately left off for Q3. If supplied,
+the code projects each updated `(a,b)` back into the allowed mean range after
+every M-step while preserving `a+b`. Those are engineering constraints that
+encode external biological expectations. Anchored initialization is also an
+engineering design, but a softer one: it encodes where plausible endpoints
+should begin without forcing where they must finish. Neither mechanism is a
+Bayesian prior, and neither follows automatically from beta-binomial theory.
+
+Therefore the user's initialization intuition is correct: initialization can
+change the fitted beta-binomial parameters, those parameters change the
+component likelihood ratio and `p_cell` posterior, and posterior thresholds
+then change the displayed classification. The anchors act at the first link in
+that chain; the optional constraints act repeatedly during parameter updates.
+
+### Figure interpretation
+
+![Q3 full initialization comparison](../figures/q3_full_initialization_comparison.png)
+
+- **Panel A** shows the same informative `sc_frac` histogram for both runs.
+  The shaded fixed tails (`<0.3`, `>0.7`) are used by anchored initialization;
+  the purple line at 0.92991 is the split initialization threshold. The final
+  cell means nearly overlap, whereas the two final low means are visibly far
+  apart.
+- **Panel B** isolates that numerical result: the orange high-component line
+  is nearly flat, while the blue low-component line rises from 0.3889 to
+  0.6408.
+- **Panel C** compares `p_cell` for the same informative droplets. The tight,
+  curved band below the identity line shows that split gives systematically
+  lower cell-component posterior probabilities, even though rank ordering is
+  similar (Pearson correlation 0.9912).
+- **Panel D** shows the thresholded consequence. Anchored `Nucleus-like` calls
+  are stable, with another 611 Neutral observations crossing into that class
+  under split. The 87,489 anchored `Cell-like` observations all become Neutral
+  under split because no split posterior strictly exceeds 0.9.
+
+### Reproducible run record
+
+- Script: `scripts/q3_initialization.py`
+- Development command:
+
+  ```bash
+  MPLCONFIGDIR=/private/tmp/cellornuc-mpl \
+    XDG_CACHE_HOME=/private/tmp/cellornuc-cache \
+    .venv/bin/python scripts/q3_initialization.py
+  ```
+
+- Full-dataset confirmation command:
+
+  ```bash
+  MPLCONFIGDIR=/private/tmp/cellornuc-mpl \
+    XDG_CACHE_HOME=/private/tmp/cellornuc-cache \
+    .venv/bin/python scripts/q3_initialization.py \
+      --input data/single_KidneyRaji_sc_full.h5ad \
+      --results-dir results/q3_full \
+      --figure figures/q3_full_initialization_comparison.png \
+      --convergence-audit-iterations 500
+  ```
+
+- The script saves `initialization_seeds.csv`, `component_parameters.csv`,
+  `component_mean_comparison.csv`, `classification_counts.csv`,
+  `classification_crosstab.csv`, `posterior_difference_summary.csv`,
+  `droplet_comparison.csv.gz`, and `summary.json` under the selected results
+  directory, plus PNG and PDF versions of the diagnostic figure. When the
+  optional audit is enabled, it also saves `convergence_audit.csv`.
+
+## 2026-09-07 — Q3b dataset A after cell-only/nucleus-only subsetting
+
+### Submission-ready answer
+
+I split the 6,000-droplet dataset A by its known `suspension_type`, producing
+3,000 cells and 3,000 nuclei. Within each subset I ran the same Q3 comparison:
+raw `counts`, all CellorNucEM model defaults, and only `init="anchored"` versus
+`init="split"` changed. Of the 3,000 observations, 2,886 cells and 2,127 nuclei
+met the default `modality_counts >= 10` fitting threshold.
+
+| Single-modality subset | Component | `p`, anchored | `p`, split | Absolute difference | Interpretation |
+|---|---|---:|---:|---:|---|
+| Cell only | Cell/high | 0.9752 | 0.9765 | 0.0012 | Stable dominant component |
+| Cell only | Nucleus/low | 0.6564 | 0.8403 | **0.1840** | Large difference |
+| Nucleus only | Cell/high | 0.3628 | 0.1699 | **0.1929** | Large difference |
+| Nucleus only | Nucleus/low | 0.0797 | 0.0687 | 0.0110 | Stable dominant component |
+
+The result is nearly mirror-symmetric. In cell-only data, the high/cell-like
+component is stable and the nominal nucleus component is sensitive to
+initialization. In nucleus-only data, the low/nucleus-like component is stable
+and the nominal cell component is sensitive. Using the same practical rule as
+Q3a (difference at least 0.05 and at least 10% of the anchored separation), the
+two absent/opposite-modality components are large differences; the two
+components matching the observed modality are small differences.
+
+This pattern arises directly from the initialization partitions. In the
+cell-only subset, the evidence-weighted split cutoff is 0.97370, inside the
+dominant high peak. Anchored initialization starts the two means at 0.9718 and
+0.1498, while split starts them at 0.9952 and 0.8300. In the nucleus-only
+subset, the split cutoff is 0.08164, inside the dominant low peak. Anchored
+initialization uses a high-tail start of 0.7914 and a low-tail start of 0.0759;
+split starts at 0.2126 and 0.0303. Only eight informative nucleus-subset
+droplets lie above the anchored `sc_frac > 0.7` threshold, illustrating how
+weakly the absent cell component is identified.
+
+The hard classifications are even more sensitive because of the strict
+default posterior cutoffs:
+
+| Subset and fit | Cell-like | Nucleus-like | Neutral |
+|---|---:|---:|---:|
+| Cell only, anchored | 2,390 | 113 | 497 |
+| Cell only, split | 0 | 130 | 2,870 |
+| Nucleus only, anchored | 40 | 1,680 | 1,280 |
+| Nucleus only, split | 111 | 0 | 2,889 |
+
+For cell-only split, `p_cell` never exceeds 0.8653, so no observation passes
+the strict `p_cell > 0.9` rule. For nucleus-only split, `p_cell` never falls
+below 0.2294, so no observation passes `p_cell < 0.1`. Consequently, 2,407
+cell-subset labels (80.23%) and 1,751 nucleus-subset labels (58.37%) change.
+These are threshold-amplified changes in model classification, not evidence
+that the droplets' known suspension identities changed.
+
+### Why carry out this experiment?
+
+Q3a alone could not distinguish a general single-modality weakness from a
+peculiarity of dataset B. Q3b supplies three useful controls:
+
+1. Dataset A already contains known cells and nuclei, so subsetting deliberately
+   removes one of two well-separated populations while retaining known source
+   identity.
+2. Cell-only and nucleus-only subsets test both directions. The mirror pattern
+   shows that sensitivity follows the **missing component**, not an intrinsic
+   preference for cells or for high `sc_frac`.
+3. The original balanced dataset A can be fit without subsetting. In that
+   control, anchored and split agree almost perfectly: cell means 0.961452 and
+   0.961521 (difference 0.000069), nucleus means 0.113037 and 0.113145
+   (difference 0.000109). Initialization is therefore not materially important
+   when both well-supported modes are present.
+
+Comparison with the 6k cell-only dataset B gives the same qualitative result:
+
+| Dataset/subset | Dominant cell mean difference | Nominal nucleus mean difference |
+|---|---:|---:|
+| Dataset A, cells only | 0.0012 | **0.1840** |
+| Dataset B, cells only | 0.0019 | **0.2373** |
+
+The replication implies that the Q3a behavior is not unique to dataset B.
+More generally, when a requested two-component mixture is fit to
+single-modality data, the component corresponding to the observed modality is
+well supported, while the second component is determined by a sparse tail or
+by an arbitrary division of the dominant peak. Anchored initialization gives
+that weak component a biologically motivated starting location. It cannot
+create information about a modality that is absent, so the component can
+still drift and should not automatically be interpreted as real contamination.
+The comparison should be qualitative rather than an expectation of identical
+numbers: datasets A and B differ biologically and technically, and dataset A
+lacks one of the ten sn-signature genes (`AC098829.1`) while dataset B contains
+all ten. Those differences can shift the absolute component locations without
+changing the shared stability pattern.
+
+The comparison also clarifies why the optional hard constraints exist.
+Anchored initialization alone does not keep the missing component near its
+starting tail. If the scientific analysis requires the labels “cell” and
+“nucleus” to mean, for example, `p_cell >= 0.8` and `p_nuc <= 0.2`, then
+`min_p_cell` and `max_p_nuc` encode those assumptions explicitly. They improve
+semantic stability at the cost of imposing external structure on the fit.
+
+### Convergence qualification
+
+As in Q3a, some default-fit differences reflect the private helper's
+100-iteration cap. With a supplemental 2,000-iteration allowance:
+
+- cell-only anchored and split stopped after 771 and 363 evaluated iterations;
+  their low means approached 0.8017 and 0.8204, reducing the difference from
+  0.1840 to 0.0186;
+- nucleus-only anchored and split stopped after 1,278 and 79 iterations; their
+  low means remained stable at 0.0704 and 0.0687, while their weak high means
+  were 0.2329 and 0.1699, a smaller but remaining 0.0630 difference.
+
+Thus the requested default comparison correctly diagnoses sensitivity of the
+implemented procedure, but the causes include both slow convergence and weak
+identifiability of the absent component. The long-run nucleus-only difference
+also shows that longer iteration alone does not guarantee perfect agreement in
+a shallow/non-convex mixture likelihood.
+
+### Figure interpretation
+
+![Q3b dataset A single-modality comparison](../figures/q3b_dataset_a_single_modality.png)
+
+- The top row is the cell-only subset. Its histogram is concentrated near one;
+  the cell-component line is nearly flat between fits, while the weak low
+  component moves upward. Split systematically lowers the cell-membership
+  posterior and pushes the former Cell-like calls below the 0.9 threshold.
+- The bottom row is the nucleus-only subset. Its histogram is concentrated near
+  zero; the nucleus-component line is nearly flat, while the weak high
+  component moves downward under split. Split raises the membership posterior
+  away from zero, eliminating default Nucleus-like calls.
+- Together, the two rows demonstrate that the stable component is the one
+  supported by the retained modality; the component on the absent side is
+  initialization-sensitive.
+
+### Reproducible run record
+
+- Script: `scripts/q3b_dataset_a_subsets.py`
+- Command:
+
+  ```bash
+  MPLCONFIGDIR=/private/tmp/cellornuc-mpl \
+    XDG_CACHE_HOME=/private/tmp/cellornuc-cache \
+    .venv/bin/python scripts/q3b_dataset_a_subsets.py \
+      --convergence-audit-iterations 2000
+  ```
+
+- Outputs under `results/q3b/`: `initialization_seeds.csv`,
+  `component_parameters.csv`, `component_mean_comparison.csv`,
+  `classification_counts.csv`, `classification_transitions.csv`,
+  `posterior_difference_summary.csv`, `comparison_with_dataset_b.csv`,
+  `convergence_audit.csv`, `droplet_comparison.csv.gz`, and `summary.json`.
+- Figure: `figures/q3b_dataset_a_single_modality.png` and PDF equivalent.
